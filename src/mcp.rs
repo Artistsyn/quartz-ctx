@@ -25,7 +25,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::model::{ApiItem, ItemKind};
-use crate::{anti_patterns, examples, helpers};
+use crate::{anti_patterns, behavior, examples, helpers, patterns, timing};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -334,6 +334,71 @@ fn tools_list_result() -> Value {
                     },
                     "required": ["intent"]
                 }
+            },
+            // ── Phase 1 Additions: Behavioral & Semantic Knowledge ──────────────────
+            {
+                "name": "get_tick_loop_order",
+                "description": "Get the complete 13-step tick loop execution order. \
+                                Shows what runs when each frame: on_update, held-keys, physics, camera, etc. \
+                                Critical for understanding timing bugs and event firing order. \
+                                Use this when code behavior doesn't match expectations (esp. timing, physics, camera).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "explain_behavior",
+                "description": "Explain Quartz behavioral rules not visible in type signatures. \
+                                Covers: when events fire, modifier handling, physics order, input timing, \
+                                rendering, hot-reload latency, text rendering, and more. \
+                                Use this to understand 'why' engine behaves the way it does.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "description": "Filter by category: input, physics, rendering, file_watching, text",
+                            "enum": ["input", "physics", "rendering", "file_watching", "text"]
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Optional: search within category (e.g., 'modifiers', 'hot-reload', 'camera')"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_usage_patterns",
+                "description": "Get real, working code examples extracted from api.txt. \
+                                Shows patterns for: multi-span colored text, word-wrapping, object pooling, \
+                                input handling with modifiers, hot-reload config, collision layers, and more. \
+                                Use this to see 'how' to correctly use complex APIs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Pattern name or category to look up (e.g., 'text', 'pooling', 'input', 'hot-reload')"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_engine_constants",
+                "description": "Get calibrated engine constants for calculations. \
+                                Returns: tick delta (0.016s), hot-reload poll (0.5s), font scale (160.0), \
+                                line height recommendations (1.35x body, 1.55x monospace). \
+                                Use this for frame-locked timing, performance tuning, and text layout.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "constant": {
+                            "type": "string",
+                            "description": "Specific constant name (e.g., 'TICK_DELTA', 'FONT_SCALE_FACTOR'), or leave blank for all"
+                        }
+                    }
+                }
             }
         ]
     })
@@ -362,6 +427,11 @@ fn tools_call(params: &Value, items: &[ApiItem]) -> Result<Value, String> {
         "find_related_types"          => tool_find_related_types(&args, items),
         "check_lifetime_constraints"  => tool_check_lifetime_constraints(&args),
         "suggest_action_for_intent"   => tool_suggest_action_for_intent(&args),
+        // ── Phase 1 additions ──
+        "get_tick_loop_order"         => tool_get_tick_loop_order(&args),
+        "explain_behavior"            => tool_explain_behavior(&args),
+        "get_usage_patterns"          => tool_get_usage_patterns(&args),
+        "get_engine_constants"        => tool_get_engine_constants(&args),
         other                         => Err(format!("unknown tool: {other}")),
     }?;
 
@@ -798,5 +868,143 @@ fn tool_suggest_action_for_intent(args: &Value) -> Result<String, String> {
     }
     out.push('\n');
     out.push_str("Use `get_variants` on any suggested Action/Condition to see exact variants and fields.\n");
+    Ok(out)
+}
+
+// ── Phase 1 Tool Implementations ───────────────────────────────────────────
+
+fn tool_get_tick_loop_order(_args: &Value) -> Result<String, String> {
+    let loop_order = timing::get_tick_loop_order();
+    
+    let mut out = String::from("# Quartz Tick Loop Execution Order (13 Steps)\n\n");
+    out.push_str("Each frame runs in this exact order. Understanding the sequence is critical for timing bugs, physics, and event firing.\n\n");
+    
+    for step in loop_order {
+        out.push_str(&format!("## Step {}: {}\n\n", step.step, step.name));
+        out.push_str(&format!("**Description:** {}\n\n", step.description));
+        
+        if !step.preconditions.is_empty() {
+            out.push_str("**Preconditions:**\n");
+            for p in &step.preconditions {
+                out.push_str(&format!("- {}\n", p));
+            }
+            out.push('\n');
+        }
+        
+        out.push_str("**Effects:**\n");
+        for e in &step.effects {
+            out.push_str(&format!("- {}\n", e));
+        }
+        
+        if let Some(note) = step.critical_note {
+            out.push_str(&format!("\n⚠️ **CRITICAL:** {}\n", note));
+        }
+        out.push('\n');
+    }
+    
+    Ok(out)
+}
+
+fn tool_explain_behavior(args: &Value) -> Result<String, String> {
+    let category = args.get("category").and_then(|v| v.as_str());
+    let query = args.get("query").and_then(|v| v.as_str());
+    
+    let rules = if let Some(cat) = category {
+        behavior::get_behavior_rule(cat)
+    } else {
+        behavior::get_behavior_rules()
+    };
+    
+    let filtered = if let Some(q) = query {
+        rules.into_iter()
+            .filter(|r| r.rule.to_lowercase().contains(&q.to_lowercase()))
+            .collect::<Vec<_>>()
+    } else {
+        rules
+    };
+    
+    if filtered.is_empty() {
+        return Ok("No behavior rules found matching your query.".to_string());
+    }
+    
+    let mut out = String::from("# Quartz Behavioral Rules\n\n");
+    
+    for rule in filtered {
+        out.push_str(&format!("## {} — {}\n\n", rule.category.to_uppercase(), rule.rule));
+        out.push_str(&format!("**When it applies:** {}\n\n", rule.when_applies));
+        
+        out.push_str("**Examples:**\n");
+        for ex in &rule.examples {
+            out.push_str(&format!("- {}\n", ex));
+        }
+        
+        out.push_str(&format!("\n**Consequence:** {}\n\n", rule.consequence));
+        out.push_str(&format!("*Source: {}*\n\n", rule.source_reference));
+    }
+    
+    Ok(out)
+}
+
+fn tool_get_usage_patterns(args: &Value) -> Result<String, String> {
+    let pattern_query = args.get("pattern").and_then(|v| v.as_str());
+    
+    let all_patterns = patterns::get_usage_patterns();
+    
+    let results = if let Some(query) = pattern_query {
+        all_patterns.into_iter()
+            .filter(|p| {
+                p.name.to_lowercase().contains(&query.to_lowercase())
+                    || p.category.to_lowercase().contains(&query.to_lowercase())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        all_patterns
+    };
+    
+    if results.is_empty() {
+        return Ok("No usage patterns found. Try categories: text, pooling, input, file_watching, collision, rendering.".to_string());
+    }
+    
+    let mut out = String::from("# Quartz Usage Patterns\n\n");
+    out.push_str("Real-world examples extracted from api.txt documentation.\n\n");
+    
+    for pattern in results {
+        out.push_str(&format!("## {} ({})\n\n", pattern.name, pattern.category));
+        out.push_str(&format!("{}\n\n", pattern.description));
+        
+        out.push_str("```rust\n");
+        out.push_str(pattern.code);
+        out.push_str("\n```\n\n");
+        
+        out.push_str(&format!("**Context:** {}\n\n", pattern.context));
+        out.push_str(&format!("*Source: {}*\n\n", pattern.source_reference));
+    }
+    
+    Ok(out)
+}
+
+fn tool_get_engine_constants(args: &Value) -> Result<String, String> {
+    let constant_name = args.get("constant").and_then(|v| v.as_str());
+    
+    let constants = if let Some(name) = constant_name {
+        if let Some(c) = helpers::get_constant(name) {
+            vec![c]
+        } else {
+            return Err(format!("Constant `{name}` not found"));
+        }
+    } else {
+        helpers::get_engine_constants()
+    };
+    
+    let mut out = String::from("# Quartz Engine Constants\n\n");
+    out.push_str("Calibrated values used throughout the engine for timing, rendering, and physics.\n\n");
+    
+    for constant in constants {
+        out.push_str(&format!("## `{}`\n\n", constant.name));
+        out.push_str(&format!("**Value:** `{} {}`\n\n", constant.value, constant.unit));
+        out.push_str(&format!("{}\n\n", constant.description));
+        out.push_str(&format!("**Usage:** {}\n\n", constant.usage));
+    }
+    
     Ok(out)
 }

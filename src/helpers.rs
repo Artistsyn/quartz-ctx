@@ -189,3 +189,73 @@ pub fn suggest_action_for_intent(intent: &str, _object_type: &str) -> Vec<String
         _ => vec!["Search quartz-ctx for related APIs".to_string()],
     }
 }
+
+// ─────────────────────────────────────────────────────────
+// ENGINE CONSTANTS LIBRARY
+// ─────────────────────────────────────────────────────────
+
+/// Engine-specific constants and calibrated values
+#[derive(Clone, Debug)]
+pub struct EngineConstant {
+    pub name: &'static str,
+    pub value: f32,
+    pub unit: &'static str,
+    pub description: &'static str,
+    pub usage: &'static str,
+}
+
+pub fn get_engine_constants() -> Vec<EngineConstant> {
+    vec![
+        EngineConstant {
+            name: "TICK_DELTA",
+            value: 0.016,
+            unit: "seconds",
+            description: "Fixed time delta per frame at 60 Hz",
+            usage: "Use for velocity scaling: velocity * TICK_DELTA; for animations needing frame-locked timing",
+        },
+        EngineConstant {
+            name: "HOT_RELOAD_POLL_INTERVAL",
+            value: 0.5,
+            unit: "seconds",
+            description: "File change detection poll interval",
+            usage: "Account for up to 0.5s latency in watch_file/watch_source callbacks",
+        },
+        EngineConstant {
+            name: "FONT_SCALE_FACTOR",
+            value: 160.0,
+            unit: "virtual units per logical pixel",
+            description: "Conversion from logical screen pixels to virtual canvas units",
+            usage: "Used internally by virt_font_size(); for manual conversions: logical_px * FONT_SCALE_FACTOR",
+        },
+        EngineConstant {
+            name: "TEXT_LINE_HEIGHT_BODY",
+            value: 1.35,
+            unit: "font size multiplier",
+            description: "Recommended line height for body text",
+            usage: "line_height_px = font_size * 1.35; typical value for readable paragraphs",
+        },
+        EngineConstant {
+            name: "TEXT_LINE_HEIGHT_MONOSPACE",
+            value: 1.55,
+            unit: "font size multiplier",
+            description: "Recommended line height for monospace/code text",
+            usage: "line_height_px = font_size * 1.55; tighter spacing for code blocks than body text",
+        },
+    ]
+}
+
+pub fn get_constant(name: &str) -> Option<EngineConstant> {
+    get_engine_constants()
+        .into_iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+pub fn get_constant_by_category(category: &str) -> Vec<EngineConstant> {
+    get_engine_constants()
+        .into_iter()
+        .filter(|c| {
+            c.usage.to_lowercase().contains(&category.to_lowercase())
+                || c.description.to_lowercase().contains(&category.to_lowercase())
+        })
+        .collect()
+}

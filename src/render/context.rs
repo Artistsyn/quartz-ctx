@@ -1,8 +1,8 @@
-/// Generates `docs/quartz-ctx/` — a structured reference tree that Copilot reads
+/// Generates `docs/<scraped-directory>/` — a structured reference tree that Copilot reads
 /// when directed to by the user's own `copilot-instructions.md`.
 ///
 /// Output layout:
-///   docs/quartz-ctx/
+///   docs/<scraped-directory>/
 ///     INDEX.md          — module map + how to read this tree
 ///     vocabulary.md     — enums (the API's composable vocabulary)
 ///     types.md          — structs with fields and methods
@@ -12,7 +12,7 @@
 ///     api-graph.json    — full machine-readable dump
 ///
 /// Add this to your existing copilot-instructions.md:
-///   Before generating any [Engine] code, review `docs/quartz-ctx/INDEX.md`
+///   Before generating any [Engine] code, review `docs/<scraped-directory>/INDEX.md`
 ///   and the relevant files in that directory for available types, enum variants,
 ///   and API constraints.
 use std::collections::BTreeMap;

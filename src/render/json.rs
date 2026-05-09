@@ -1,4 +1,4 @@
-/// Renders `docs/api-graph.json` — a machine-readable dump of the full API surface.
+/// Renders `docs/<scraped-directory>/api-graph.json` — a machine-readable dump of the full API surface.
 /// Useful for tooling beyond Copilot (custom LSP overlays, web dashboards, etc.).
 use anyhow::Result;
 use crate::model::ApiItem;

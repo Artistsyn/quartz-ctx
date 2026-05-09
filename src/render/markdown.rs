@@ -1,4 +1,4 @@
-/// Renders `docs/api-reference.md` — a human-readable full API reference.
+/// Renders the human-readable API reference files in `docs/<scraped-directory>/`.
 /// Organized by kind, with full signatures, field tables, method lists, and doc text.
 use crate::model::{ApiItem, ItemKind};
 

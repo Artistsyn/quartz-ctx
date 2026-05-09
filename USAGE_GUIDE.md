@@ -51,7 +51,7 @@ If you don't want to add to PATH, reference the binary directly in `.vscode/mcp.
 
 - After making changes to the Quartz API
 - To create reference docs for offline browsing
-- To include in version control (check in the generated `docs/quartz-ctx/` directory)
+- To keep local by default (generated docs now land in `docs/<scraped-directory>/` and are ignored)
 - As a backup/fallback when MCP server isn't running
 
 ### Command
@@ -69,7 +69,7 @@ quartz-ctx generate --source quartz/src --name Quartz
 
 ### Output
 
-Generates these files in `docs/quartz-ctx/`:
+Generates these files in `docs/<scraped-directory>/`:
 
 | File | Contents |
 |------|----------|
@@ -315,7 +315,7 @@ I need to rotate a sprite around a pivot point. What's the method?
 
 - Run `generate` once after major API changes (nightly builds, version bumps)
 - Keep `serve` running in `.vscode/mcp.json` for interactive sessions
-- Commit generated `docs/quartz-ctx/` to version control
+- Review `docs/<scraped-directory>/` locally before sharing or unignoring it intentionally
 - Use `PROTOCOL - QUARTZ -` to ensure consistency between static cache and live API
 
 ---
@@ -355,7 +355,7 @@ After API changes in `quartz/`:
 cd quartz-ctx
 cargo run -- generate --source ../quartz/src --name Quartz
 cd ..
-git add docs/quartz-ctx/
+git add -f docs/<scraped-directory>/
 git commit -m "Update Quartz API docs"
 ```
 

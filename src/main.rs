@@ -1,11 +1,15 @@
 mod anti_patterns;
+mod behavior;
 mod examples;
 mod helpers;
 mod mcp;
 mod model;
 mod parser;
+mod patterns;
 mod render;
+mod timing;
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -20,7 +24,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Generate static markdown documentation tree at docs/quartz-ctx/.
+    /// Generate static markdown documentation tree at docs/<scraped-directory>/.
     /// 
     /// Run this once after API changes to refresh the docs that Copilot reads.
     /// Output includes INDEX.md (entry point), vocabulary.md (enums), types.md, traits.md,
@@ -30,7 +34,7 @@ enum Command {
     ///   quartz-ctx generate --source quartz/src --name Quartz
     /// 
     /// Then add to .github/copilot-instructions.md:
-    ///   Before writing Quartz code, review docs/quartz-ctx/INDEX.md
+    ///   Before writing Quartz code, review docs/quartz/INDEX.md
     Generate(GenerateArgs),
 
     /// Run as an MCP stdio skill server for live API lookups.
@@ -73,7 +77,7 @@ struct GenerateArgs {
     name: String,
 
     /// Subdirectory name under docs/ for the context tree.
-    /// Defaults to a lowercase slug of --name, e.g. "quartz-ctx".
+    /// Defaults to the scraped directory name, e.g. "quartz" for `--source ../quartz/src`.
     #[arg(long)]
     context_dir: Option<String>,
 
@@ -135,9 +139,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let ctx_dir_name = args.context_dir.unwrap_or_else(|| {
-        format!("{}-ctx", args.name.to_lowercase().replace(' ', "-"))
-    });
+    let ctx_dir_name = args.context_dir.unwrap_or_else(|| default_context_dir_name(&args.source));
     let ctx_dir = args.output.join("docs").join(&ctx_dir_name);
 
     let context = render::context::render(&items, &args.name, &ctx_dir)?;
@@ -210,4 +212,42 @@ fn summarise(items: &[model::ApiItem]) -> Counts {
         }
     }
     c
+}
+
+fn default_context_dir_name(source: &Path) -> String {
+    let candidate = if source.file_name().and_then(|name| name.to_str()) == Some("src") {
+        source
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_owned())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| {
+                        cwd.file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| name.to_owned())
+                    })
+            })
+    } else {
+        source.file_name().and_then(|name| name.to_str()).map(|name| name.to_owned())
+    };
+
+    slugify(candidate.as_deref().unwrap_or("docs"))
+}
+
+fn slugify(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' | '-' => ch,
+            ' ' | '_' => '-',
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
