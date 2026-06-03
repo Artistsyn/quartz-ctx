@@ -193,7 +193,7 @@ pub fn get_all_anti_patterns() -> Vec<AntiPattern> {
     ]
 }
 
-pub fn find_anti_patterns_for_type(type_name: &str) -> Vec<&'static AntiPattern> {
+pub fn find_anti_patterns_for_type(_type_name: &str) -> Vec<&'static AntiPattern> {
     // This would be called at runtime with the static list
     // For now, returns matching patterns
     vec![]

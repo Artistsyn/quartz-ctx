@@ -1,5 +1,5 @@
 // Validation and helper functions for Quartz API analysis
-use crate::model::{ApiItem, ItemKind};
+use crate::model::ApiItem;
 
 /// Builder chain validation
 pub struct BuilderValidation {

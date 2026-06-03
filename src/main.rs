@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports, unused_variables)]
+
 mod anti_patterns;
 mod behavior;
 mod examples;
@@ -12,8 +14,10 @@ mod timing;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{anyhow, Context, Result};
+use clap::{error::ErrorKind, Parser, Subcommand};
+use serde_json::json;
+use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(name = "quartz-ctx", version, about = "API context tool and MCP skill server")]
@@ -58,6 +62,14 @@ enum Command {
     ///   - search_items({\"query\": \"gravity\"})
     ///   - list_items({\"kind\": \"enum\"})
     Serve(ServeArgs),
+
+    /// Run startup diagnostics and source validation.
+    ///
+    /// Helpful when MCP fails to boot or source paths are incorrect.
+    ///
+    /// Example:
+    ///   quartz-ctx selfcheck --source quartz/src --name Quartz
+    Selfcheck(SelfcheckArgs),
 }
 
 // ── generate ──────────────────────────────────────────────────────────────────
@@ -103,14 +115,61 @@ struct ServeArgs {
     name: String,
 }
 
+// ── selfcheck ────────────────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+struct SelfcheckArgs {
+    /// Source directory to validate (must contain .rs files).
+    #[arg(short, long, default_value = "src")]
+    source: PathBuf,
+
+    /// Engine / stack name shown in startup recommendations.
+    #[arg(short, long, default_value = "Quartz")]
+    name: String,
+
+    /// Emit machine-readable diagnostics to stdout.
+    #[arg(long)]
+    json: bool,
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli_with_diagnostics()?;
 
     match cli.command {
         Command::Generate(args) => run_generate(args),
         Command::Serve(args)    => run_serve(args),
+        Command::Selfcheck(args)=> run_selfcheck(args),
+    }
+}
+
+fn parse_cli_with_diagnostics() -> Result<Cli> {
+    match Cli::try_parse() {
+        Ok(cli) => Ok(cli),
+        Err(err) => {
+            let kind = err.kind();
+            let argv: Vec<String> = std::env::args().collect();
+            let has_mode = argv.iter().any(|a| a == "serve" || a == "generate" || a == "selfcheck");
+            let has_serve_flags = argv.iter().any(|a| a == "--source" || a == "-s" || a == "--name" || a == "-n");
+
+            let _ = err.print();
+
+            if !has_mode && has_serve_flags {
+                eprintln!(
+                    "hint: quartz-ctx requires an explicit subcommand. For MCP use:\n  quartz-ctx serve --source <path> --name <engine>"
+                );
+                eprintln!(
+                    "hint: in .vscode/mcp.json, args should start with \"serve\" before --source/--name"
+                );
+            }
+
+            let exit_code = match kind {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+                _ => 2,
+            };
+            std::process::exit(exit_code);
+        }
     }
 }
 
@@ -178,12 +237,102 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     // All diagnostic output goes to stderr so stdout stays clean for JSON-RPC.
     eprintln!("quartz-ctx serve: loading {}", args.source.display());
 
+    if !args.source.exists() {
+        return Err(anyhow!(
+            "source path does not exist: {}\nhelp: verify --source path and MCP working directory",
+            args.source.display()
+        ));
+    }
+
     let items = parser::parse_dir(&args.source)
         .with_context(|| format!("failed to parse source dir: {}", args.source.display()))?;
+
+    if items.is_empty() {
+        return Err(anyhow!(
+            "no public API items found in {}\nhelp: verify this points to the engine src directory (example: quartz/src)",
+            args.source.display()
+        ));
+    }
 
     eprintln!("  loaded {} API items — listening on stdio", items.len());
 
     mcp::serve(items, &args.name)
+}
+
+fn run_selfcheck(args: SelfcheckArgs) -> Result<()> {
+    let source_exists = args.source.exists();
+    let rs_files = if source_exists {
+        WalkDir::new(&args.source)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("rs"))
+            .count()
+    } else {
+        0
+    };
+
+    let (items_count, counts, parse_error) = if source_exists {
+        match parser::parse_dir(&args.source) {
+            Ok(items) => {
+                let count = items.len();
+                (count, Some(summarise(&items)), None)
+            }
+            Err(err) => (0, None, Some(err.to_string())),
+        }
+    } else {
+        (0, None, Some("source path does not exist".to_owned()))
+    };
+
+    let ok = source_exists && rs_files > 0 && parse_error.is_none() && items_count > 0;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": ok,
+                "source": args.source,
+                "source_exists": source_exists,
+                "rs_files": rs_files,
+                "items": items_count,
+                "counts": counts.as_ref().map(|c| json!({
+                    "structs": c.structs,
+                    "enums": c.enums,
+                    "traits": c.traits,
+                    "functions": c.fns,
+                    "other": c.other,
+                })),
+                "error": parse_error,
+                "mcp_args_recommended": ["serve", "--source", args.source.display().to_string(), "--name", args.name],
+            }))?
+        );
+    } else {
+        eprintln!("quartz-ctx selfcheck");
+        eprintln!("  source: {}", args.source.display());
+        eprintln!("  source exists: {}", source_exists);
+        eprintln!("  rust files found: {}", rs_files);
+        if let Some(c) = counts {
+            eprintln!(
+                "  api items: {} (structs: {} enums: {} traits: {} fns: {} other: {})",
+                items_count, c.structs, c.enums, c.traits, c.fns, c.other
+            );
+        }
+        if let Some(err) = parse_error {
+            eprintln!("  parse error: {err}");
+        }
+        eprintln!(
+            "  recommended MCP args: [\"serve\", \"--source\", \"{}\", \"--name\", \"{}\"]",
+            args.source.display(),
+            args.name
+        );
+        eprintln!("  status: {}", if ok { "OK" } else { "FAIL" });
+    }
+
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!("quartz-ctx selfcheck failed"))
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

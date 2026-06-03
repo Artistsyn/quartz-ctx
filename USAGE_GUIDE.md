@@ -134,8 +134,7 @@ At the FlowMake root (`.vscode/mcp.json`):
     "quartz-ctx": {
       "type": "stdio",
       "command": "quartz-ctx",
-      "args": ["serve", "--source", "quartz/src", "--name", "Quartz"],
-      "description": "Live Quartz API context tool"
+      "args": ["serve", "--source", "quartz/src", "--name", "Quartz"]
     }
   }
 }
@@ -158,6 +157,22 @@ Copilot should call `list_items` and return a categorized list. If nothing appea
 1. Is `quartz-ctx` binary in PATH or correctly configured?
 2. Is `.vscode/mcp.json` valid JSON?
 3. Did you restart VS Code after adding the server config?
+
+### Startup Diagnostics (Recommended)
+
+Run this before wiring MCP if you suspect path or parse issues:
+
+```bash
+quartz-ctx selfcheck --source quartz/src --name Quartz
+```
+
+Machine-readable output for automation:
+
+```bash
+quartz-ctx selfcheck --source quartz/src --name Quartz --json
+```
+
+If `status` is `FAIL`, fix source path/parsing first. MCP `args` must begin with `serve`.
 
 ### Available Tools
 
