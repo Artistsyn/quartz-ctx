@@ -106,9 +106,12 @@ struct GenerateArgs {
 
 #[derive(Parser, Debug)]
 struct ServeArgs {
-    /// Source directory to load (scanned once at startup).
+    /// Source directory to load. REPEATABLE — pass multiple --source flags to
+    /// serve several roots from one server (e.g. quartz/src, synful_quartz/quartz/src,
+    /// path_forge/src). The first source is the primary engine; items from every
+    /// root are tagged with an origin slug so lookups can tell them apart.
     #[arg(short, long, default_value = "src")]
-    source: PathBuf,
+    source: Vec<PathBuf>,
 
     /// Engine / stack name reported in the MCP server info.
     #[arg(short, long, default_value = "Quartz")]
@@ -235,28 +238,58 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
 
 fn run_serve(args: ServeArgs) -> Result<()> {
     // All diagnostic output goes to stderr so stdout stays clean for JSON-RPC.
-    eprintln!("quartz-ctx serve: loading {}", args.source.display());
-
-    if !args.source.exists() {
-        return Err(anyhow!(
-            "source path does not exist: {}\nhelp: verify --source path and MCP working directory",
-            args.source.display()
-        ));
+    // Build (path, origin-slug) pairs. The primary source may not be missing;
+    // extra sources that are missing are skipped with a warning so one absent
+    // experimental root can't take the whole server down.
+    let mut sources: Vec<(PathBuf, String)> = Vec::new();
+    for (i, src) in args.source.iter().enumerate() {
+        if !src.exists() {
+            if i == 0 {
+                return Err(anyhow!(
+                    "primary source path does not exist: {}\nhelp: verify --source path and MCP working directory",
+                    src.display()
+                ));
+            }
+            eprintln!("warn: skipping missing source: {}", src.display());
+            continue;
+        }
+        let mut tag = default_context_dir_name(src);
+        if sources.iter().any(|(_, t)| *t == tag) {
+            // Slug collision (e.g. quartz/src and synful_quartz/quartz/src both
+            // resolve to "quartz") — disambiguate with the grandparent directory.
+            if let Some(alt) = src
+                .components()
+                .rev()
+                .filter(|c| c.as_os_str() != "src")
+                .nth(1)
+                .map(|c| slugify(&c.as_os_str().to_string_lossy()))
+                .filter(|s| !s.is_empty())
+            {
+                tag = alt;
+            }
+            if sources.iter().any(|(_, t)| *t == tag) {
+                tag = format!("{tag}-{}", sources.len());
+            }
+        }
+        sources.push((src.clone(), tag));
     }
 
-    let items = parser::parse_dir(&args.source)
-        .with_context(|| format!("failed to parse source dir: {}", args.source.display()))?;
+    for (path, tag) in &sources {
+        eprintln!("quartz-ctx serve: loading {} (origin: {tag})", path.display());
+    }
+
+    let items = parser::load_sources(&sources)
+        .with_context(|| "failed to parse source dirs")?;
 
     if items.is_empty() {
         return Err(anyhow!(
-            "no public API items found in {}\nhelp: verify this points to the engine src directory (example: quartz/src)",
-            args.source.display()
+            "no public API items found in any source\nhelp: verify --source points at engine src directories (example: quartz/src)"
         ));
     }
 
-    eprintln!("  loaded {} API items — listening on stdio", items.len());
+    eprintln!("  loaded {} API items from {} source(s) — listening on stdio", items.len(), sources.len());
 
-    mcp::serve(items, &args.name)
+    mcp::serve(items, &args.name, sources)
 }
 
 fn run_selfcheck(args: SelfcheckArgs) -> Result<()> {

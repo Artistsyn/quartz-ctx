@@ -12,6 +12,7 @@ use crate::model::*;
 /// Recursively parse all `.rs` files under `dir` and return every public API item found.
 pub fn parse_dir(dir: &Path) -> Result<Vec<ApiItem>> {
     let mut all_items: Vec<ApiItem> = Vec::new();
+    let mut orphan_impls: Vec<PendingImpl> = Vec::new();
 
     for entry in WalkDir::new(dir)
         .into_iter()
@@ -30,8 +31,9 @@ pub fn parse_dir(dir: &Path) -> Result<Vec<ApiItem>> {
         match syn::parse_file(&content) {
             Ok(file) => {
                 let module_path = derive_module_path(dir, path);
-                let items = extract_items(&file, &module_path);
+                let (items, leftovers) = extract_items(&file, &module_path);
                 all_items.extend(items);
+                orphan_impls.extend(leftovers);
             }
             Err(e) => {
                 eprintln!("warn: could not parse {}: {}", path.display(), e);
@@ -39,10 +41,45 @@ pub fn parse_dir(dir: &Path) -> Result<Vec<ApiItem>> {
         }
     }
 
-    // Second pass: attach impl methods to their owning types.
-    // (impl blocks targeting a type that lives in a different file are not merged here,
-    //  but for single-crate use this covers the common case.)
+    // Global second pass: attach impl blocks whose owning type lives in a
+    // DIFFERENT file. Quartz spreads `impl Canvas` across 9 files
+    // (canvas/actions.rs, conditions.rs, physics.rs, ...) — the old per-file
+    // attachment silently discarded all of them, serving Canvas with zero
+    // methods and gutting plugin surfaces.
+    for pending in orphan_impls {
+        if let Some(owner) = all_items.iter_mut().find(|i| i.name == pending.self_ty) {
+            for method in pending.methods {
+                // Dedupe by name: the same method can appear via re-parse or
+                // cfg-gated duplicate definitions.
+                if !owner.methods.iter().any(|m| m.name == method.name) {
+                    owner.methods.push(method);
+                }
+            }
+            if let Some(tr) = pending.trait_name {
+                if !tr.is_empty() && !owner.traits_impl.contains(&tr) {
+                    owner.traits_impl.push(tr);
+                }
+            }
+        }
+        // Types from outside the scanned roots (e.g. std types) stay unattached.
+    }
+
     Ok(all_items)
+}
+
+/// Parse multiple source roots, tagging every item with its origin slug.
+/// Order matters: the FIRST source is the primary engine — lookups that match
+/// multiple origins prefer it.
+pub fn load_sources(sources: &[(std::path::PathBuf, String)]) -> Result<Vec<ApiItem>> {
+    let mut all = Vec::new();
+    for (path, tag) in sources {
+        let mut items = parse_dir(path)?;
+        for item in &mut items {
+            item.origin = tag.clone();
+        }
+        all.extend(items);
+    }
+    Ok(all)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -113,15 +150,15 @@ fn sig_to_string(sig: &syn::Signature) -> String {
 
 // ── Visitor ──────────────────────────────────────────────────────────────────
 
-fn extract_items(file: &syn::File, module_path: &[String]) -> Vec<ApiItem> {
+fn extract_items(file: &syn::File, module_path: &[String]) -> (Vec<ApiItem>, Vec<PendingImpl>) {
     let mut visitor = ApiVisitor {
         items: Vec::new(),
         module_path: module_path.to_vec(),
         pending_impls: Vec::new(),
     };
     visitor.visit_file(file);
-    visitor.flush_impls();
-    visitor.items
+    let leftovers = visitor.flush_impls();
+    (visitor.items, leftovers)
 }
 
 struct PendingImpl {
@@ -138,19 +175,28 @@ struct ApiVisitor {
 }
 
 impl ApiVisitor {
-    /// Attach all collected impl blocks to the items that match.
-    fn flush_impls(&mut self) {
+    /// Attach collected impl blocks to items in THIS file (fast path).
+    /// Impls whose owning type lives in another file are RETURNED so the
+    /// caller can attach them in a global pass — never discarded.
+    fn flush_impls(&mut self) -> Vec<PendingImpl> {
+        let mut leftovers = Vec::new();
         for pending in self.pending_impls.drain(..) {
             if let Some(owner) = self.items.iter_mut().find(|i| i.name == pending.self_ty) {
-                owner.methods.extend(pending.methods);
+                for method in pending.methods {
+                    if !owner.methods.iter().any(|m| m.name == method.name) {
+                        owner.methods.push(method);
+                    }
+                }
                 if let Some(tr) = pending.trait_name {
-                    if !owner.traits_impl.contains(&tr) {
+                    if !tr.is_empty() && !owner.traits_impl.contains(&tr) {
                         owner.traits_impl.push(tr);
                     }
                 }
+            } else {
+                leftovers.push(pending);
             }
-            // If no owner was found (type from another file), silently discard.
         }
+        leftovers
     }
 }
 
@@ -198,6 +244,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             fields,
             generics,
             traits_impl: vec![],
+            origin: String::new(),
         });
 
         syn::visit::visit_item_struct(self, node);
@@ -258,6 +305,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             fields: vec![],
             generics,
             traits_impl: vec![],
+            origin: String::new(),
         });
 
         syn::visit::visit_item_enum(self, node);
@@ -280,6 +328,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             fields: vec![],
             generics: generics_to_string(&node.sig.generics),
             traits_impl: vec![],
+            origin: String::new(),
         });
     }
 
@@ -320,6 +369,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             fields: vec![],
             generics,
             traits_impl: vec![],
+            origin: String::new(),
         });
 
         syn::visit::visit_item_trait(self, node);
@@ -399,6 +449,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             fields: vec![],
             generics: generics_to_string(&node.generics),
             traits_impl: vec![],
+            origin: String::new(),
         });
     }
 
@@ -409,14 +460,23 @@ impl<'ast> Visit<'ast> for ApiVisitor {
         }
 
         let ty = &node.ty;
+        // Capture the actual value expression (truncated) — agents asking for
+        // engine constants need the real number, not an ellipsis.
+        let expr = &node.expr;
+        let mut value = quote!(#expr).to_string().replace(" :: ", "::");
+        if value.len() > 60 {
+            value.truncate(57);
+            value.push_str("...");
+        }
         self.items.push(ApiItem {
             kind: ItemKind::Const,
             name: node.ident.to_string(),
             doc: extract_docs(&node.attrs),
             signature: format!(
-                "pub const {}: {} = …;",
+                "pub const {}: {} = {};",
                 node.ident,
-                type_to_string(ty)
+                type_to_string(ty),
+                value
             ),
             module_path: self.module_path.clone(),
             methods: vec![],
@@ -424,6 +484,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             fields: vec![],
             generics: String::new(),
             traits_impl: vec![],
+            origin: String::new(),
         });
     }
 
@@ -436,8 +497,9 @@ impl<'ast> Visit<'ast> for ApiVisitor {
                 self.visit_item(item);
             }
             self.module_path = old_path;
-            // Flush impls scoped to this module before restoring path.
-            self.flush_impls();
+            // NOTE: no flush here — the single file-level flush in extract_items
+            // attaches everything and returns cross-file leftovers to the caller.
+            // An inner flush would drop leftover impls from this module.
         }
     }
 }

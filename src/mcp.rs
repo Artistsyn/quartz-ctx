@@ -20,19 +20,120 @@
 ///     }
 ///   }
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use walkdir::WalkDir;
 
 use crate::model::{ApiItem, ItemKind};
-use crate::{anti_patterns, behavior, examples, helpers, patterns, timing};
+use crate::{anti_patterns, behavior, examples, helpers, parser, patterns, timing};
+
+// ── Source auto-reload ────────────────────────────────────────────────────────
+
+/// How often (at most) we stat-scan the source trees for changes.
+const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Cheap change fingerprint: FNV over every .rs path + mtime in all sources.
+fn source_fingerprint(sources: &[(PathBuf, String)]) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+    };
+    for (path, _) in sources {
+        for entry in WalkDir::new(path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+        {
+            mix(entry.path().to_string_lossy().as_bytes());
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                        mix(&d.as_secs().to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+    h
+}
+
+/// Re-parse the sources if anything changed since the last check.
+/// The API served is therefore always ground truth — no server restarts needed
+/// after engine edits.
+fn maybe_reload(
+    items: &mut Vec<ApiItem>,
+    sources: &[(PathBuf, String)],
+    last_check: &mut Instant,
+    fingerprint: &mut u64,
+) {
+    if sources.is_empty() || last_check.elapsed() < RELOAD_CHECK_INTERVAL {
+        return;
+    }
+    *last_check = Instant::now();
+
+    let fp = source_fingerprint(sources);
+    if fp == *fingerprint {
+        return;
+    }
+    *fingerprint = fp;
+
+    match parser::load_sources(sources) {
+        Ok(new_items) if !new_items.is_empty() => {
+            eprintln!(
+                "quartz-ctx: source change detected — reloaded {} API items (was {})",
+                new_items.len(), items.len()
+            );
+            *items = new_items;
+        }
+        Ok(_) => eprintln!("quartz-ctx: reload produced 0 items — keeping previous data"),
+        Err(e) => eprintln!("quartz-ctx: reload failed ({e}) — keeping previous data"),
+    }
+}
+
+// ── Curated-knowledge gating ──────────────────────────────────────────────────
+
+/// Tools backed by hand-curated QUARTZ engine knowledge (examples.rs,
+/// anti_patterns.rs, patterns.rs, behavior.rs, timing.rs, helpers.rs).
+/// On a non-Quartz project this content would be confidently WRONG, so these
+/// tools are only registered when serving the Quartz engine. The generic core
+/// (get_api_context, get_item, get_variants, search_items, list_items,
+/// find_related_types) is parsed live from source and works on ANY Rust project.
+const CURATED_QUARTZ_TOOLS: &[&str] = &[
+    "get_code_examples",
+    "check_anti_patterns",
+    "get_trait_implementations",
+    "get_builder_methods",
+    "validate_physics_config",
+    "get_return_type_usage",
+    "check_lifetime_constraints",
+    "suggest_action_for_intent",
+    "get_tick_loop_order",
+    "explain_behavior",
+    "get_usage_patterns",
+    "get_engine_constants",
+];
+
+/// Curated Quartz knowledge is served only for the Quartz engine.
+fn is_quartz(engine_name: &str) -> bool {
+    engine_name.eq_ignore_ascii_case("quartz")
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn serve(items: Vec<ApiItem>, engine_name: &str) -> Result<()> {
+pub fn serve(items: Vec<ApiItem>, engine_name: &str, sources: Vec<(PathBuf, String)>) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+
+    let mut items = items;
+    let mut last_check = Instant::now();
+    let mut fingerprint = source_fingerprint(&sources);
 
     eprintln!("quartz-ctx MCP server ready ({} items loaded)", items.len());
 
@@ -63,10 +164,15 @@ pub fn serve(items: Vec<ApiItem>, engine_name: &str) -> Result<()> {
         let id = req["id"].clone();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
+        // Keep served data in sync with the source tree (throttled stat scan).
+        if method == "tools/call" {
+            maybe_reload(&mut items, &sources, &mut last_check, &mut fingerprint);
+        }
+
         let result = match method {
             "initialize"  => Ok(initialize_result(engine_name)),
-            "tools/list"  => Ok(tools_list_result()),
-            "tools/call"  => tools_call(&params, &items),
+            "tools/list"  => Ok(tools_list_result(is_quartz(engine_name))),
+            "tools/call"  => tools_call(&params, &items, engine_name),
             other         => Err(format!("unknown method: {other}")),
         };
 
@@ -100,8 +206,8 @@ fn initialize_result(engine_name: &str) -> Value {
     })
 }
 
-fn tools_list_result() -> Value {
-    json!({
+fn tools_list_result(curated: bool) -> Value {
+    let full = json!({
         "tools": [
             // ── Core Lookup Tools (Original 4) ────────────────────────────────────
             {
@@ -399,17 +505,73 @@ fn tools_list_result() -> Value {
                         }
                     }
                 }
+            },
+            // ── Compact context injection ────────────────────────────────────────
+            {
+                "name": "get_api_context",
+                "description": "Get a compact, budgeted API context packet for a task. Pass a task \
+                                description or keywords (e.g. 'spawn pooled bullets with collision and sound') \
+                                and receive the most relevant types, enum variant names, and method signatures \
+                                in minimal form — one call instead of several get_item/search_items round trips. \
+                                Use this FIRST when starting a coding task; drill into specifics with \
+                                get_variants/get_item afterwards.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "hint": {
+                            "type": "string",
+                            "description": "Task description or keywords driving relevance ranking."
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Output budget in characters (default 4000)."
+                        },
+                        "origin": {
+                            "type": "string",
+                            "description": "Optional origin filter: e.g. 'quartz', 'synful-quartz', 'path-forge'."
+                        }
+                    },
+                    "required": ["hint"]
+                }
             }
         ]
-    })
+    });
+
+    if curated {
+        return full;
+    }
+
+    // Non-Quartz project: expose only the generic, source-parsed tools.
+    let tools: Vec<Value> = full["tools"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|t| {
+                    let name = t["name"].as_str().unwrap_or("");
+                    !CURATED_QUARTZ_TOOLS.contains(&name)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({ "tools": tools })
 }
 
 // ── Tool dispatch ─────────────────────────────────────────────────────────────
 
-fn tools_call(params: &Value, items: &[ApiItem]) -> Result<Value, String> {
+fn tools_call(params: &Value, items: &[ApiItem], engine_name: &str) -> Result<Value, String> {
     let tool_name = params["name"]
         .as_str()
         .ok_or("missing tool name")?;
+
+    if !is_quartz(engine_name) && CURATED_QUARTZ_TOOLS.contains(&tool_name) {
+        return Err(format!(
+            "tool `{tool_name}` serves hand-curated QUARTZ engine knowledge and is disabled \
+             for engine '{engine_name}' — its answers would not apply to this codebase. \
+             Use the generic source-parsed tools instead: get_api_context, get_item, \
+             get_variants, search_items, list_items, find_related_types."
+        ));
+    }
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
@@ -418,6 +580,7 @@ fn tools_call(params: &Value, items: &[ApiItem]) -> Result<Value, String> {
         "list_items"                  => tool_list_items(&args, items),
         "search_items"                => tool_search_items(&args, items),
         "get_variants"                => tool_get_variants(&args, items),
+        "get_api_context"             => tool_get_api_context(&args, items),
         "get_code_examples"           => tool_get_code_examples(&args, items),
         "check_anti_patterns"         => tool_check_anti_patterns(&args, items),
         "get_trait_implementations"   => tool_get_trait_implementations(&args, items),
@@ -445,12 +608,24 @@ fn tools_call(params: &Value, items: &[ApiItem]) -> Result<Value, String> {
 fn tool_get_item(args: &Value, items: &[ApiItem]) -> Result<String, String> {
     let name = args["name"].as_str().ok_or("missing `name`")?;
 
-    let item = items
-        .iter()
-        .find(|i| i.name == name)
+    // Items keep source order: the first match is from the primary engine.
+    let matches: Vec<&ApiItem> = items.iter().filter(|i| i.name == name).collect();
+    let item = *matches.first()
         .ok_or_else(|| format!("no item named `{name}` found"))?;
 
     let mut out = format!("# `{}` ({})\n\n", item.name, item.kind.label());
+
+    if !item.origin.is_empty() {
+        out.push_str(&format!("origin: `{}`", item.origin));
+        let others: Vec<&str> = matches.iter().skip(1)
+            .map(|i| i.origin.as_str())
+            .filter(|o| !o.is_empty())
+            .collect();
+        if !others.is_empty() {
+            out.push_str(&format!("  (also defined in: {})", others.join(", ")));
+        }
+        out.push_str("\n\n");
+    }
 
     if !item.module_str().is_empty() {
         out.push_str(&format!("module: `{}`\n\n", item.module_str()));
@@ -599,6 +774,9 @@ fn tool_search_items(args: &Value, items: &[ApiItem]) -> Result<String, String> 
         out.push_str(&format!("- `{}` ({}", item.name, item.kind.label()));
         if !item.module_str().is_empty() {
             out.push_str(&format!(", module: `{}`", item.module_str()));
+        }
+        if !item.origin.is_empty() {
+            out.push_str(&format!(", origin: `{}`", item.origin));
         }
         out.push(')');
         if !item.doc_summary().is_empty() {
@@ -783,12 +961,119 @@ fn tool_get_builder_methods(args: &Value, _items: &[ApiItem]) -> Result<String, 
 }
 
 fn tool_validate_physics_config(_args: &Value) -> Result<String, String> {
-    // Stub implementation — expand with real validation logic
+    // Honest output: no automated validation is implemented yet. The previous
+    // version claimed "All settings compatible" unconditionally, which trained
+    // agents to trust a check that never ran.
     let mut out = String::from("# Physics Configuration Validation\n\n");
-    out.push_str("**Status:** All settings compatible.\n\n");
-    out.push_str("**Warnings:**\n");
-    out.push_str("- Check that gravity direction matches your game's coordinate system.\n");
-    out.push_str("- Ensure collision_layers are assigned to affected GameObjects.\n");
+    out.push_str("**Status:** NO automated validation was performed — this tool is a heuristic checklist only.\n\n");
+    out.push_str("**Manual checklist (verify each yourself against source):**\n");
+    out.push_str("- Gravity direction matches your game's coordinate system (positive Y is down in Quartz).\n");
+    out.push_str("- `collision_layer(0)` silently disables dynamic-to-dynamic collision — use a non-zero layer.\n");
+    out.push_str("- Manually-controlled objects (obstacles, decorations) need `gravity = 0.0` or pooled instances accumulate momentum offscreen.\n");
+    out.push_str("- `physics.resistance` is the damping field — `physics.friction` does not exist.\n");
+    out.push_str("- TerrainCollisionPlugin `object_size` is a `(f32, f32)` tuple, not a scalar.\n\n");
+    out.push_str("Use `get_item` on the physics types involved to verify exact field names and defaults.\n");
+    Ok(out)
+}
+
+/// get_api_context — one-call compact context packet for a task hint.
+///
+/// Scores every item against the hint words and renders the winners in
+/// minimal form (signatures, variant names, method names) within a character
+/// budget. Replaces several get_item/search_items round trips at task start.
+fn tool_get_api_context(args: &Value, items: &[ApiItem]) -> Result<String, String> {
+    let hint = args["hint"].as_str().ok_or("missing `hint`")?;
+    let budget = args.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+    let budget = budget.clamp(500, 20_000);
+    let origin_filter = args.get("origin").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Tokenize the hint: lowercase words of length >= 3, deduped.
+    let mut words: Vec<String> = hint
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 3)
+        .map(str::to_string)
+        .collect();
+    words.dedup();
+    if words.is_empty() {
+        return Err("hint contains no usable keywords (need words of 3+ characters)".to_string());
+    }
+
+    // Score every item as the sum of per-word signals.
+    let mut scored: Vec<(i64, &ApiItem)> = items
+        .iter()
+        .filter(|i| origin_filter.is_empty() || i.origin == origin_filter)
+        .filter_map(|item| {
+            let name = item.name.to_lowercase();
+            let module = item.module_str().to_lowercase();
+            let doc = item.doc.to_lowercase();
+            let mut score: i64 = 0;
+            for w in &words {
+                if &name == w                 { score += 300; }
+                else if name.contains(w)      { score += 100; }
+                if module.contains(w)         { score += 40; }
+                if doc.contains(w)            { score += 30; }
+                if item.variants.iter().any(|v| v.name.to_lowercase().contains(w)) { score += 25; }
+                if item.methods.iter().any(|m| m.name.to_lowercase().contains(w))  { score += 25; }
+            }
+            if score > 0 { Some((score, item)) } else { None }
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+
+    if scored.is_empty() {
+        return Ok(format!("No API context found for `{hint}`. Try broader keywords or `list_items`."));
+    }
+
+    let mut out = format!("# API context for: {hint}\n\n");
+    let mut included = 0usize;
+    for (_score, item) in &scored {
+        let mut block = String::new();
+        let origin = if item.origin.is_empty() { String::new() } else { format!(", {}", item.origin) };
+        block.push_str(&format!("### `{}` ({}{})", item.name, item.kind.label(), origin));
+        if !item.doc_summary().is_empty() {
+            block.push_str(&format!(" — {}", item.doc_summary()));
+        }
+        block.push('\n');
+
+        match item.kind {
+            ItemKind::Enum => {
+                // Variant NAMES only — the vocabulary; get_variants gives fields.
+                let names: Vec<&str> = item.variants.iter().map(|v| v.name.as_str()).collect();
+                if !names.is_empty() {
+                    block.push_str(&format!("variants ({}): {}\n", names.len(), names.join(", ")));
+                }
+            }
+            _ => {
+                // Up to 8 method signatures, truncated — the callable surface.
+                for m in item.methods.iter().take(8) {
+                    let mut sig = m.signature.clone();
+                    if sig.len() > 100 { sig.truncate(97); sig.push_str("..."); }
+                    block.push_str(&format!("  - `{sig}`\n"));
+                }
+                if item.methods.len() > 8 {
+                    block.push_str(&format!("  - ... {} more (use get_item)\n", item.methods.len() - 8));
+                }
+                if !item.fields.is_empty() && item.methods.is_empty() {
+                    let fields: Vec<String> = item.fields.iter().take(10)
+                        .map(|f| format!("{}: {}", f.name, f.ty)).collect();
+                    block.push_str(&format!("fields: {}\n", fields.join(", ")));
+                }
+            }
+        }
+        block.push('\n');
+
+        if out.len() + block.len() > budget {
+            let remaining = scored.len() - included;
+            out.push_str(&format!("*(budget reached — {remaining} more relevant item(s); refine the hint or raise max_chars)*\n"));
+            break;
+        }
+        out.push_str(&block);
+        included += 1;
+        if included >= 15 { break; }
+    }
+
+    out.push_str("\nDrill down with get_variants(<enum>) or get_item(<type>) for full field/doc detail.\n");
     Ok(out)
 }
 

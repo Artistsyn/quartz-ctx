@@ -21,6 +21,10 @@ pub struct ApiItem {
     pub generics: String,
     /// Trait names this type implements (from `impl Trait for Type` blocks).
     pub traits_impl: Vec<String>,
+    /// Which source root this item came from (e.g. "quartz", "synful-quartz",
+    /// "path-forge"). Empty for single-source runs. Set by the loader, not the parser.
+    #[serde(default)]
+    pub origin: String,
 }
 
 impl ApiItem {
